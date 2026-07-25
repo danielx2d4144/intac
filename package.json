@@ -1,0 +1,14 @@
+{
+  "name": "agentvoice",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Voice supervision layer for coding agents - the agent speaks 15-second summaries, you answer by voice. Stage 0.",
+  "scripts": {
+    "t1": "node platform/t1-hook.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "msedge-tts": "^2.0.7"
+  }
+}

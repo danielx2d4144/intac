@@ -1,0 +1,11 @@
+I've implemented the dark mode feature as requested.
+
+Changes made:
+- src/components/Settings.tsx: added the theme toggle switch
+- src/hooks/useTheme.ts: new hook managing theme state with localStorage persistence
+- src/styles/themes.css: dark variants for all component tokens
+- src/components/Chart.tsx: attempted theme support
+
+Test results: 24 passed, 0 failed
+
+One issue: two hardcoded colors in the chart library (Chart.tsx lines 47 and 89) don't respond to the theme variables. Want me to patch those with CSS custom properties too?

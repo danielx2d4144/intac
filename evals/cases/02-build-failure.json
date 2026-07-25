@@ -1,0 +1,8 @@
+{
+  "name": "failing build, no question",
+  "eventType": "Stop",
+  "projectName": "api server",
+  "turnText": "I attempted the migration but hit a blocker.\n\nWhat I did:\n- migrations/0042_add_indexes.sql: created\n- src/db/schema.ts: updated types\n\nBuild output:\nerror TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string' in src/db/client.ts line 88.\n\nBuild failed. I stopped here rather than force a cast, since client.ts is used by every query path. The null can only come from a missing DATABASE_URL env var.",
+  "mustMention": ["fail"],
+  "mustAskQuestion": false
+}

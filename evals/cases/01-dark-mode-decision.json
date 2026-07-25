@@ -1,0 +1,8 @@
+{
+  "name": "dark mode with open decision",
+  "eventType": "Stop",
+  "projectName": "demo app",
+  "turnText": "I've implemented the dark mode feature as requested.\n\nChanges made:\n- src/components/Settings.tsx: added the theme toggle switch\n- src/hooks/useTheme.ts: new hook managing theme state with localStorage persistence\n- src/styles/themes.css: dark variants for all component tokens\n\nTest results: 24 passed, 0 failed\n\nOne issue: two hardcoded colors in the chart library (Chart.tsx lines 47 and 89) don't respond to the theme variables. Want me to patch those with CSS custom properties too?",
+  "mustMention": ["dark", "test"],
+  "mustAskQuestion": true
+}
