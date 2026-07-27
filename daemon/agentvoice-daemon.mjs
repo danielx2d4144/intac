@@ -21,26 +21,15 @@ import { promisify } from "node:util";
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { PsWorker } from "./ps-worker.mjs";
 
 const pExecFile = promisify(execFile);
 const MUTE_FILE = join(homedir(), ".agentvoice", "muted");
 const STT_MODEL = process.env.AGENTVOICE_STT_MODEL || "gemini-flash-lite-latest";
-const PTT_SECONDS = Number(process.env.AGENTVOICE_PTT_SECONDS || 5);
 // Window-title pattern for the paste target (regex, case-insensitive).
 // Claude Code sets its terminal title; "claude" matches the default. Press L to
 // list candidate windows if pasting lands nowhere.
 const TARGET_TITLE = process.env.AGENTVOICE_TARGET_TITLE || "claude";
-
-const WIN_TYPE = `
-Add-Type -AssemblyName System.Windows.Forms;
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public class AvWin {
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
-}
-'@;`;
 
 const ps = (script, timeout = 120000) =>
   pExecFile(
@@ -57,9 +46,13 @@ if (!tryAcquireLock()) {
 const beat = setInterval(heartbeat, 15_000);
 let busy = false;
 let quitting = false;
+let recording = false;
+let recStartedAt = 0;
+const worker = new PsWorker();
+await worker.start();
 
 const say = (s) => console.log(`[agentvoice] ${s}`);
-say(`daemon up. pid=${process.pid} stt=${STT_MODEL}`);
+say(`daemon up. pid=${process.pid} stt=${STT_MODEL} (warm ps-worker ready)`);
 say(existsSync(MUTE_FILE) ? "status: MUTED" : "status: active");
 
 // ---- spool drain loop (voice OUT, warm) ------------------------------------
@@ -100,32 +93,29 @@ async function drainOnce() {
 }
 const drainTimer = setInterval(drainOnce, 500);
 
-// ---- push-to-talk (voice IN) -------------------------------------------------
-async function pushToTalk() {
-  if (busy) { say("busy speaking — try again in a moment"); return; }
+// ---- push-to-talk (voice IN) — V toggles: press to start, press to stop -----
+async function pttStart() {
+  const r = await worker.cmd("REC_START");
+  if (!r.startsWith("OK")) { say(`mic failed: ${r}`); return; }
+  recording = true;
+  recStartedAt = Date.now();
+  say("recording — press V again when you're done speaking...");
+}
+
+async function pttStopAndSend() {
+  recording = false;
   busy = true;
   try {
+    const t0 = Date.now();
     const dir = join(tmpdir(), "agentvoice");
     mkdirSync(dir, { recursive: true });
     const wav = join(dir, `ptt-${Date.now()}.wav`);
-    say(`recording ${PTT_SECONDS}s — SPEAK NOW...`);
-    const t0 = Date.now();
-    const recScript = `
-$sig = '[DllImport("winmm.dll", CharSet = CharSet.Auto)] public static extern int mciSendString(string lpstrCommand, System.Text.StringBuilder lpstrReturnString, int uReturnLength, IntPtr hwndCallback);';
-Add-Type -Name MCI -Namespace Win32 -MemberDefinition $sig;
-[Win32.MCI]::mciSendString('open new type waveaudio alias rec', $null, 0, [IntPtr]::Zero) | Out-Null;
-[Win32.MCI]::mciSendString('set rec time format ms bitspersample 16 channels 1 samplespersec 16000 bytespersec 32000 alignment 2', $null, 0, [IntPtr]::Zero) | Out-Null;
-[Win32.MCI]::mciSendString('record rec', $null, 0, [IntPtr]::Zero) | Out-Null;
-Start-Sleep -Seconds ${PTT_SECONDS};
-[Win32.MCI]::mciSendString('stop rec', $null, 0, [IntPtr]::Zero) | Out-Null;
-[Win32.MCI]::mciSendString('save rec "${wav.replace(/\\/g, "\\\\")}"', $null, 0, [IntPtr]::Zero) | Out-Null;
-[Win32.MCI]::mciSendString('close rec', $null, 0, [IntPtr]::Zero) | Out-Null;
-'RECORDED';`;
-    await ps(recScript, (PTT_SECONDS + 15) * 1000);
+    const stopRes = await worker.cmd("REC_STOP", wav);
+    if (!stopRes.startsWith("OK")) { say(`mic save failed: ${stopRes}`); return; }
+    const spokeMs = t0 - recStartedAt;
     const wavBytes = readFileSync(wav);
     if (wavBytes.length < 1000) { say("no audio captured"); return; }
 
-    say("transcribing...");
     const { geminiKey } = getConfig();
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${STT_MODEL}:generateContent`,
@@ -151,42 +141,28 @@ Start-Sleep -Seconds ${PTT_SECONDS};
       ?.filter((p) => typeof p.text === "string" && !p.thought)
       .map((p) => p.text).join("").trim();
     if (!transcript || transcript === "[SILENCE]") { say("nothing intelligible"); return; }
-    say(`heard (${Date.now() - t0}ms total): "${transcript}"`);
+    const sttMs = Date.now() - t0;
+    say(`heard: "${transcript}"`);
 
-    const b64 = Buffer.from(transcript, "utf8").toString("base64");
-    await ps(`$t=[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')); Set-Clipboard -Value $t; 'OK'`);
-
-    const enter = process.env.AGENTVOICE_NO_ENTER ? "" : "[System.Windows.Forms.SendKeys]::SendWait('{ENTER}');";
+    await worker.cmd("CLIP", transcript);
+    const wantEnter = process.env.AGENTVOICE_NO_ENTER ? "0" : "1";
     if (process.env.AGENTVOICE_FOCUS_MODE === "manual") {
       say("FOCUS YOUR AGENT WINDOW — pasting in 5s...");
       await new Promise((r) => setTimeout(r, 5000));
+      const enter = wantEnter === "1" ? "[System.Windows.Forms.SendKeys]::SendWait('{ENTER}');" : "";
       await ps(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v'); Start-Sleep -Milliseconds 300; ${enter} 'SENT'`);
       say("sent.");
     } else {
-      // Deterministic targeting: focus the window whose title matches, then paste.
-      // The Alt keypress before SetForegroundWindow defeats Windows focus-stealing rules.
-      const focusScript = `${WIN_TYPE}
-$re = '${TARGET_TITLE.replace(/'/g, "''")}';
-$p = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -match $re -and $_.Id -ne ${process.pid} } | Select-Object -First 1;
-if (-not $p) { 'NO_TARGET'; exit 0 };
-[AvWin]::keybd_event(0x12,0,0,[UIntPtr]::Zero);
-[AvWin]::SetForegroundWindow($p.MainWindowHandle) | Out-Null;
-[AvWin]::keybd_event(0x12,0,2,[UIntPtr]::Zero);
-Start-Sleep -Milliseconds 500;
-[System.Windows.Forms.SendKeys]::SendWait('^v');
-Start-Sleep -Milliseconds 300;
-${enter}
-'SENT_TO: ' + $p.MainWindowTitle;`;
-      const { stdout } = await ps(focusScript);
-      const out = stdout.trim();
-      if (out.includes("NO_TARGET")) {
-        say(`no window title matched /${TARGET_TITLE}/i — transcript is on your clipboard.`);
-        say("press L to list window titles, then set AGENTVOICE_TARGET_TITLE and restart.");
+      const out = await worker.cmd("FOCUS_PASTE", TARGET_TITLE, wantEnter);
+      if (out.startsWith("ERR")) {
+        say(`no window matched /${TARGET_TITLE}/i — transcript is on your clipboard. Press L to list windows.`);
       } else {
-        say(out.split("\n").pop());
+        say(out.replace("OK FOCUS_PASTE", "pasted into:"));
       }
     }
-    logEvent({ type: "ptt", ms: Date.now() - t0, chars: transcript.length });
+    const totalMs = Date.now() - t0;
+    say(`latency: spoke ${(spokeMs / 1000).toFixed(1)}s | stop-to-text ${sttMs}ms | stop-to-sent ${totalMs}ms`);
+    logEvent({ type: "ptt", spokeMs, sttMs, totalMs, chars: transcript.length });
   } catch (err) {
     say(`ptt failed: ${String(err).slice(0, 150)}`);
   } finally {
@@ -194,12 +170,18 @@ ${enter}
   }
 }
 
+async function pushToTalk() {
+  if (recording) return pttStopAndSend();
+  if (busy) { say("busy — try again in a moment"); return; }
+  return pttStart();
+}
+
 // ---- keys ---------------------------------------------------------------------
 if (process.stdin.isTTY) {
   const readline = await import("node:readline");
   readline.emitKeypressEvents(process.stdin);
   process.stdin.setRawMode(true);
-  say("keys: [V] talk  [M] mute  [L] list windows  [Q] quit");
+  say("keys: [V] talk (press to start, press again to send)  [M] mute  [L] list windows  [Q] quit");
   // Paste-burst guard: characters arriving <30ms apart are a paste landing in
   // our own window, not a human pressing command keys - ignore until it settles.
   let lastKeyAt = 0;
@@ -234,6 +216,7 @@ function shutdown() {
   say("shutting down...");
   clearInterval(drainTimer);
   clearInterval(beat);
+  worker.stop();
   releaseLock();
   process.exit(0);
 }

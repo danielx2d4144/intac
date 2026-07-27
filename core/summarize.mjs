@@ -8,28 +8,37 @@ const SYSTEM = `You are the voice of a coding agent, speaking a quick over-the-s
 
 async function viaGemini(userText) {
   const { geminiKey, geminiModel } = getConfig();
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent`,
-    {
-      method: "POST",
-      headers: { "x-goog-api-key": geminiKey, "content-type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM }] },
-        contents: [{ role: "user", parts: [{ text: userText }] }],
-        generationConfig: { maxOutputTokens: 1500 },
-      }),
-      signal: AbortSignal.timeout(15000),
-    },
-  );
-  if (!res.ok) throw new Error(`gemini ${res.status}`);
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts
-    ?.filter((p) => typeof p.text === "string" && !p.thought)
-    .map((p) => p.text)
-    .join("")
-    .trim();
-  if (!text) throw new Error("gemini empty completion");
-  return text;
+  // Free tier throttles intermittently: give a real budget and one retry.
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent`,
+        {
+          method: "POST",
+          headers: { "x-goog-api-key": geminiKey, "content-type": "application/json" },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: SYSTEM }] },
+            contents: [{ role: "user", parts: [{ text: userText }] }],
+            generationConfig: { maxOutputTokens: 1500 },
+          }),
+          signal: AbortSignal.timeout(30000),
+        },
+      );
+      if (!res.ok) throw new Error(`gemini ${res.status}`);
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts
+        ?.filter((p) => typeof p.text === "string" && !p.thought)
+        .map((p) => p.text)
+        .join("")
+        .trim();
+      if (!text) throw new Error("gemini empty completion");
+      return text;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
 }
 
 async function viaAnthropic(userText) {
