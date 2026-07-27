@@ -26,6 +26,21 @@ const pExecFile = promisify(execFile);
 const MUTE_FILE = join(homedir(), ".agentvoice", "muted");
 const STT_MODEL = process.env.AGENTVOICE_STT_MODEL || "gemini-flash-lite-latest";
 const PTT_SECONDS = Number(process.env.AGENTVOICE_PTT_SECONDS || 5);
+// Window-title pattern for the paste target (regex, case-insensitive).
+// Claude Code sets its terminal title; "claude" matches the default. Press L to
+// list candidate windows if pasting lands nowhere.
+const TARGET_TITLE = process.env.AGENTVOICE_TARGET_TITLE || "claude";
+
+const WIN_TYPE = `
+Add-Type -AssemblyName System.Windows.Forms;
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class AvWin {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+}
+'@;`;
 
 const ps = (script, timeout = 120000) =>
   pExecFile(
@@ -146,12 +161,31 @@ Start-Sleep -Seconds ${PTT_SECONDS};
       say("FOCUS YOUR AGENT WINDOW — pasting in 5s...");
       await new Promise((r) => setTimeout(r, 5000));
       await ps(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v'); Start-Sleep -Milliseconds 300; ${enter} 'SENT'`);
+      say("sent.");
     } else {
-      // Auto-return: Alt+Tab back to the window you came from, then paste there.
-      say("returning to your previous window and pasting...");
-      await ps(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('%{TAB}'); Start-Sleep -Milliseconds 600; [System.Windows.Forms.SendKeys]::SendWait('^v'); Start-Sleep -Milliseconds 300; ${enter} 'SENT'`);
+      // Deterministic targeting: focus the window whose title matches, then paste.
+      // The Alt keypress before SetForegroundWindow defeats Windows focus-stealing rules.
+      const focusScript = `${WIN_TYPE}
+$re = '${TARGET_TITLE.replace(/'/g, "''")}';
+$p = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -match $re -and $_.Id -ne ${process.pid} } | Select-Object -First 1;
+if (-not $p) { 'NO_TARGET'; exit 0 };
+[AvWin]::keybd_event(0x12,0,0,[UIntPtr]::Zero);
+[AvWin]::SetForegroundWindow($p.MainWindowHandle) | Out-Null;
+[AvWin]::keybd_event(0x12,0,2,[UIntPtr]::Zero);
+Start-Sleep -Milliseconds 500;
+[System.Windows.Forms.SendKeys]::SendWait('^v');
+Start-Sleep -Milliseconds 300;
+${enter}
+'SENT_TO: ' + $p.MainWindowTitle;`;
+      const { stdout } = await ps(focusScript);
+      const out = stdout.trim();
+      if (out.includes("NO_TARGET")) {
+        say(`no window title matched /${TARGET_TITLE}/i — transcript is on your clipboard.`);
+        say("press L to list window titles, then set AGENTVOICE_TARGET_TITLE and restart.");
+      } else {
+        say(out.split("\n").pop());
+      }
     }
-    say("sent.");
     logEvent({ type: "ptt", ms: Date.now() - t0, chars: transcript.length });
   } catch (err) {
     say(`ptt failed: ${String(err).slice(0, 150)}`);
@@ -165,7 +199,7 @@ if (process.stdin.isTTY) {
   const readline = await import("node:readline");
   readline.emitKeypressEvents(process.stdin);
   process.stdin.setRawMode(true);
-  say("keys: [V] talk  [M] mute  [Q] quit");
+  say("keys: [V] talk  [M] mute  [L] list windows  [Q] quit");
   // Paste-burst guard: characters arriving <30ms apart are a paste landing in
   // our own window, not a human pressing command keys - ignore until it settles.
   let lastKeyAt = 0;
@@ -183,6 +217,12 @@ if (process.stdin.isTTY) {
       else { writeFileSync(MUTE_FILE, new Date().toISOString()); logEvent({ type: "mute" }); say("MUTED (desktop notifications only)"); }
     }
     if (k === "v") await pushToTalk();
+    if (k === "l") {
+      const { stdout } = await ps(`Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } | ForEach-Object { $_.ProcessName + ' | ' + $_.MainWindowTitle }`);
+      say("windows with titles:");
+      console.log(stdout.trim());
+      say(`current target pattern: /${TARGET_TITLE}/i (set AGENTVOICE_TARGET_TITLE to change)`);
+    }
   });
 } else {
   say("no TTY — running headless (voice-out only)");
