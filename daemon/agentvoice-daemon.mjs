@@ -121,7 +121,7 @@ Start-Sleep -Seconds ${PTT_SECONDS};
           contents: [{
             role: "user",
             parts: [
-              { text: "Transcribe this audio verbatim. Output ONLY the spoken words, no commentary, no quotes. If silent or unintelligible, output exactly: [SILENCE]" },
+              { text: "Transcribe this audio verbatim. The speaker is a software developer dictating commands and prompts - prefer technical terms when ambiguous (git, npm, commit, branch, deploy, merge, test, build, push, pull). Output ONLY the spoken words, no commentary, no quotes. If silent or unintelligible, output exactly: [SILENCE]" },
               { inline_data: { mime_type: "audio/wav", data: wavBytes.toString("base64") } },
             ],
           }],
@@ -140,10 +140,17 @@ Start-Sleep -Seconds ${PTT_SECONDS};
 
     const b64 = Buffer.from(transcript, "utf8").toString("base64");
     await ps(`$t=[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')); Set-Clipboard -Value $t; 'OK'`);
-    say("FOCUS YOUR AGENT WINDOW — pasting in 3s...");
-    await new Promise((r) => setTimeout(r, 3000));
+
     const enter = process.env.AGENTVOICE_NO_ENTER ? "" : "[System.Windows.Forms.SendKeys]::SendWait('{ENTER}');";
-    await ps(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v'); Start-Sleep -Milliseconds 300; ${enter} 'SENT'`);
+    if (process.env.AGENTVOICE_FOCUS_MODE === "manual") {
+      say("FOCUS YOUR AGENT WINDOW — pasting in 5s...");
+      await new Promise((r) => setTimeout(r, 5000));
+      await ps(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v'); Start-Sleep -Milliseconds 300; ${enter} 'SENT'`);
+    } else {
+      // Auto-return: Alt+Tab back to the window you came from, then paste there.
+      say("returning to your previous window and pasting...");
+      await ps(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('%{TAB}'); Start-Sleep -Milliseconds 600; [System.Windows.Forms.SendKeys]::SendWait('^v'); Start-Sleep -Milliseconds 300; ${enter} 'SENT'`);
+    }
     say("sent.");
     logEvent({ type: "ptt", ms: Date.now() - t0, chars: transcript.length });
   } catch (err) {
@@ -159,8 +166,16 @@ if (process.stdin.isTTY) {
   readline.emitKeypressEvents(process.stdin);
   process.stdin.setRawMode(true);
   say("keys: [V] talk  [M] mute  [Q] quit");
+  // Paste-burst guard: characters arriving <30ms apart are a paste landing in
+  // our own window, not a human pressing command keys - ignore until it settles.
+  let lastKeyAt = 0;
+  let burstUntil = 0;
   process.stdin.on("keypress", async (_str, key) => {
     if (!key) return;
+    const now = Date.now();
+    if (now - lastKeyAt < 30) burstUntil = now + 300;
+    lastKeyAt = now;
+    if (now < burstUntil) return;
     const k = (key.name || "").toLowerCase();
     if (k === "q" || (key.ctrl && k === "c")) return shutdown();
     if (k === "m") {
