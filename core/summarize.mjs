@@ -6,6 +6,33 @@ import { getConfig } from "./config.mjs";
 
 const SYSTEM = `You are the voice of a coding agent, speaking a quick over-the-shoulder update to the developer. From the structured extract of the agent's last turn, produce ONE spoken-style summary of at most 40 words covering: outcome (done/failed/partial), naming the feature or task in the agent's own words (if the agent says "dark mode", say "dark mode", not a paraphrase), scope (what changed, key files in plain words - say "settings component", not full paths), and test/build status if present. If and ONLY if the agent's own text explicitly asked the developer a question, end with that question restated briefly. NEVER invent a question, suggestion, or next step the agent did not state - if the agent asked nothing, the summary ends with the status. No markdown, no code syntax, no file extensions spelled out. Sound human.`;
 
+async function viaGroq(userText) {
+  const { groqKey } = getConfig();
+  const model = process.env.AGENTVOICE_GROQ_MODEL || "openai/gpt-oss-120b";
+  const isReasoner = model.includes("gpt-oss");
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${groqKey}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      // Reasoning models spend tokens thinking before answering - give headroom.
+      max_tokens: isReasoner ? 800 : 120,
+      temperature: 0,
+      ...(isReasoner ? { reasoning_effort: "low" } : {}),
+      messages: [
+        { role: "system", content: SYSTEM + " CRITICAL: Do not phrase anything as a question unless the agent's text literally contains a question mark addressed to the developer. Statements of failure stay statements." },
+        { role: "user", content: userText },
+      ],
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) throw new Error(`groq ${res.status}`);
+  const data = await res.json();
+  const text = data.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("groq empty completion");
+  return text;
+}
+
 async function viaGemini(userText) {
   const { geminiKey, geminiModel } = getConfig();
   // Free tier throttles intermittently: give a real budget and one retry.
@@ -68,9 +95,11 @@ async function viaAnthropic(userText) {
 export async function summarize({ extract, eventType, projectName }) {
   const prefix = eventType === "Notification" ? "Needs you: " : "";
   const userText = `Project: ${projectName}\nEvent: ${eventType}\n\n${extract}`;
-  const { geminiKey, anthropicKey } = getConfig();
+  const { geminiKey, anthropicKey, groqKey } = getConfig();
 
   const providers = [];
+  // Groq first: free tier responds in <1s where Gemini's queue takes 8-15s.
+  if (groqKey.startsWith("gsk_")) providers.push(["groq", viaGroq]);
   // Google keys: classic "AIza..." or the newer "AQ." format.
   if (geminiKey.startsWith("AIza") || geminiKey.startsWith("AQ.")) providers.push(["gemini", viaGemini]);
   if (anthropicKey.startsWith("sk-ant-")) providers.push(["anthropic", viaAnthropic]);
