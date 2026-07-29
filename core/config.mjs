@@ -23,6 +23,7 @@ export function getConfig() {
     anthropicKey: file.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "",
     openaiKey: file.OPENAI_API_KEY || process.env.OPENAI_API_KEY || "",
     geminiKey: file.GEMINI_API_KEY || process.env.GEMINI_API_KEY || "",
+    groqKey: file.GROQ_API_KEY || process.env.GROQ_API_KEY || "",
     model: file.AGENTVOICE_MODEL || process.env.AGENTVOICE_MODEL || "claude-haiku-4-5-20251001",
     geminiModel: file.AGENTVOICE_GEMINI_MODEL || process.env.AGENTVOICE_GEMINI_MODEL || "gemini-flash-lite-latest",
     edgeVoice: file.AGENTVOICE_EDGE_VOICE || "en-US-AvaMultilingualNeural",

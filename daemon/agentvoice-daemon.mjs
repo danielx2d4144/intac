@@ -15,17 +15,16 @@ import { tryAcquireLock, releaseLock, heartbeat, drainSpool } from "../core/spoo
 import { lastAssistantTurn } from "../integrations/transcript.mjs";
 import { runPipeline } from "../core/pipeline.mjs";
 import { logEvent } from "../core/log.mjs";
-import { getConfig } from "../core/config.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { PsWorker } from "./ps-worker.mjs";
+import { transcribe } from "../core/stt.mjs";
 
 const pExecFile = promisify(execFile);
 const MUTE_FILE = join(homedir(), ".agentvoice", "muted");
-const STT_MODEL = process.env.AGENTVOICE_STT_MODEL || "gemini-flash-lite-latest";
 // Window-title pattern for the paste target (regex, case-insensitive).
 // Claude Code sets its terminal title; "claude" matches the default. Press L to
 // list candidate windows if pasting lands nowhere.
@@ -52,7 +51,7 @@ const worker = new PsWorker();
 await worker.start();
 
 const say = (s) => console.log(`[agentvoice] ${s}`);
-say(`daemon up. pid=${process.pid} stt=${STT_MODEL} (warm ps-worker ready)`);
+say(`daemon up. pid=${process.pid} stt=groq→gemini (warm ps-worker ready)`);
 say(existsSync(MUTE_FILE) ? "status: MUTED" : "status: active");
 
 // ---- spool drain loop (voice OUT, warm) ------------------------------------
@@ -116,33 +115,11 @@ async function pttStopAndSend() {
     const wavBytes = readFileSync(wav);
     if (wavBytes.length < 1000) { say("no audio captured"); return; }
 
-    const { geminiKey } = getConfig();
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${STT_MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: { "x-goog-api-key": geminiKey, "content-type": "application/json" },
-        body: JSON.stringify({
-          contents: [{
-            role: "user",
-            parts: [
-              { text: "Transcribe this audio verbatim. The speaker is a software developer dictating commands and prompts - prefer technical terms when ambiguous (git, npm, commit, branch, deploy, merge, test, build, push, pull). Output ONLY the spoken words, no commentary, no quotes. If silent or unintelligible, output exactly: [SILENCE]" },
-              { inline_data: { mime_type: "audio/wav", data: wavBytes.toString("base64") } },
-            ],
-          }],
-          generationConfig: { maxOutputTokens: 2000 },
-        }),
-        signal: AbortSignal.timeout(30000),
-      },
-    );
-    if (!res.ok) { say(`stt failed: ${res.status}`); return; }
-    const data = await res.json();
-    const transcript = data.candidates?.[0]?.content?.parts
-      ?.filter((p) => typeof p.text === "string" && !p.thought)
-      .map((p) => p.text).join("").trim();
-    if (!transcript || transcript === "[SILENCE]") { say("nothing intelligible"); return; }
+    const stt = await transcribe(wavBytes);
+    const transcript = stt.text;
+    if (!transcript) { say(`nothing intelligible (stt: ${stt.provider})`); return; }
     const sttMs = Date.now() - t0;
-    say(`heard: "${transcript}"`);
+    say(`heard [${stt.provider}]: "${transcript}"`);
 
     await worker.cmd("CLIP", transcript);
     const wantEnter = process.env.AGENTVOICE_NO_ENTER ? "0" : "1";
